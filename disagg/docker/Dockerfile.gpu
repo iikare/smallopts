@@ -1,0 +1,197 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+# ======== Base Stage ========
+ARG BASE_IMAGE=nvidia/cuda:13.1.2-devel-ubuntu24.04
+
+FROM ${BASE_IMAGE}
+
+ARG https_proxy
+ARG http_proxy
+
+# setup environment variables for CUDA
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+# install basic dependencies for Python and building from source
+# CUDA 13.1 devel base already has python3, pip, build-essential.
+# Only install git if not present; symlink python -> python3.
+RUN apt-get update && apt-get install -y --no-install-recommends git || true && \
+    rm -rf /var/lib/apt/lists/* && \
+    ln -sf /usr/bin/python3 /usr/bin/python
+
+# Setup venv for python
+RUN apt-get update && apt-get install -y --no-install-recommends python3-venv && rm -rf /var/lib/apt/lists/*
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Pre-upgrade pip and setuptools to support the latest wheel builds
+RUN pip install --upgrade pip setuptools wheel
+
+# Install build tools needed for UCX/NIXL
+# wget/curl/git likely already in base; autoconf/libtool/libaio-dev needed for build
+RUN apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    apt-get update --fix-missing && \
+    apt-get install -y --fix-missing wget curl git autoconf libtool libaio-dev || \
+    (apt-get update && apt-get install -y --fix-missing wget curl git autoconf libtool libaio-dev)
+
+# Remove any pre-existing UCX installations to prevent version conflicts
+RUN apt-get remove --purge -y ucx libucx0 libucx-dev 2>/dev/null || true && \
+    rm -rf /opt/hpcx/ucx /opt/hpcx*/ucx /usr/local/ucx /usr/lib/x86_64-linux-gnu/libuc* 2>/dev/null || true && \
+    ldconfig
+
+# (1) UCX git clone and build
+ARG UCX_REPO_URL=https://github.com/openucx/ucx.git
+ARG UCX_BRANCH=master
+ARG UCX_SRC_DIR=/tmp/ucx-openucx
+ARG UCX_INSTALL_DIR=/opt/ucx
+ARG UCX_VERSION=v1.20.1
+
+RUN git clone ${UCX_REPO_URL} -b ${UCX_BRANCH} ${UCX_SRC_DIR} && \
+    cd ${UCX_SRC_DIR} && \
+    if [ -n "${UCX_VERSION}" ]; then \
+        git checkout ${UCX_VERSION} || \
+        ( echo "UCX checkout to ${UCX_VERSION} failed. Go ahead without it." && git reset --hard ); \
+    else \
+        echo "No UCX_VERSION specified. Use branch ${UCX_BRANCH}."; \
+    fi
+
+WORKDIR ${UCX_SRC_DIR}
+RUN libtoolize --force --copy && \
+    autoheader && \
+    aclocal && \
+    autoconf
+
+# Install RDMA dependencies for UCX
+RUN apt-get update --fix-missing || apt-get update
+RUN apt-get remove --purge libibverbs1 libibverbs-dev librdmacm1 librdmacm-dev -y || true
+RUN apt-get autoremove -y
+RUN apt-get autoclean -y
+RUN apt-get install -y --fix-missing libibverbs1 libibverbs-dev librdmacm1 librdmacm-dev rdma-core libaio-dev || \
+    (apt-get update && apt-get install -y --fix-missing libibverbs1 libibverbs-dev librdmacm1 librdmacm-dev rdma-core libaio-dev)
+
+RUN automake --add-missing --copy
+RUN ./autogen.sh
+RUN ./configure --prefix=${UCX_INSTALL_DIR} --with-mlx5=no --enable-examples --enable-mt --with-cuda=/usr/local/cuda
+
+RUN make CFLAGS="-Wno-error=frame-larger-than=" -j$(nproc) && make install
+
+# Update library cache and verify UCX installation
+RUN echo "${UCX_INSTALL_DIR}/lib" > /etc/ld.so.conf.d/ucx.conf && \
+    ldconfig && \
+    ${UCX_INSTALL_DIR}/bin/ucx_info -v && \
+    echo "✅ UCX installed to ${UCX_INSTALL_DIR}"
+
+# (2) NIXL dir and build
+# python3-dev needed for NIXL Python bindings (meson Python dependency check)
+RUN apt-get update && apt-get install -y --no-install-recommends python3-dev && rm -rf /var/lib/apt/lists/*
+
+ARG NIXL_REPO_URL=https://github.com/ai-dynamo/nixl.git
+ARG NIXL_BRANCH=main
+ARG NIXL_VERSION=0.10.0  # NIXL 0.10.0 - telemetry works
+ARG NIXL_SRC_DIR=/tmp/nixl-nvidia
+
+RUN git clone ${NIXL_REPO_URL} -b ${NIXL_BRANCH} ${NIXL_SRC_DIR} && \
+    cd ${NIXL_SRC_DIR} && \
+    if [ -n "${NIXL_VERSION}" ]; then \
+        git checkout ${NIXL_VERSION} || \
+        ( echo "NIXL checkout to ${NIXL_VERSION} failed. Use branch ${NIXL_BRANCH}." && git reset --hard ); \
+    else \
+        echo "No NIXL_VERSION specified. Use branch ${NIXL_BRANCH}."; \
+    fi && \
+    pip install meson ninja pybind11
+
+# python3-dev provides pkgconfig needed by meson Python dependency check
+RUN apt-get update && apt-get install -y --no-install-recommends python3-dev && rm -rf /var/lib/apt/lists/*
+
+WORKDIR ${NIXL_SRC_DIR}
+RUN meson setup --reconfigure install \
+        --prefix=/opt/nvidia/nvda_nixl \
+        -Ducx_path=${UCX_INSTALL_DIR} \
+        -Dcudapath_inc=/usr/local/cuda/include \
+        -Dcudapath_lib=/usr/local/cuda/lib64 \
+        -Dinstall_headers=true \
+        -Ddisable_gds_backend=false
+
+# Update meson_options.txt and pip install nixl
+WORKDIR ${NIXL_SRC_DIR}
+RUN sed -i "s|\(option('ucx_path', type: 'string', value: \)'\([^']*\)|\1'${UCX_INSTALL_DIR}|" meson_options.txt && \
+    pip install .
+WORKDIR ${NIXL_SRC_DIR}/install
+RUN ninja install
+
+# Symlink nixl_cu* -> nixl for clean imports
+RUN PYTHON_SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])") && \
+    NIXL_ACTUAL_DIR=$(find "$PYTHON_SITE_PACKAGES" -maxdepth 1 -type d -name "nixl_cu*" | head -1) && \
+    NIXL_ALIAS_DIR="$PYTHON_SITE_PACKAGES/nixl" && \
+    if [ -n "$NIXL_ACTUAL_DIR" ] && [ -d "$NIXL_ACTUAL_DIR" ]; then \
+        ln -sfn "$NIXL_ACTUAL_DIR" "$NIXL_ALIAS_DIR" && \
+        echo "✅ Created nixl symlink: $NIXL_ALIAS_DIR -> $NIXL_ACTUAL_DIR"; \
+    else \
+        echo "⚠️ Warning: nixl_cu* not found in $PYTHON_SITE_PACKAGES"; \
+        exit 1; \
+    fi
+
+# Also create symlink in the installed prefix location
+RUN NIXL_ACTUAL_DIR=$(find /opt/nvidia/nvda_nixl/lib/python3/dist-packages -maxdepth 1 -type d -name "nixl_cu*" 2>/dev/null | head -1) && \
+    if [ -n "$NIXL_ACTUAL_DIR" ] && [ -d "$NIXL_ACTUAL_DIR" ]; then \
+        ln -sf "$NIXL_ACTUAL_DIR" /opt/nvidia/nvda_nixl/lib/python3/dist-packages/nixl && \
+        echo "✅ Created nixl symlink in nvda_nixl: $(basename $NIXL_ACTUAL_DIR) -> nixl"; \
+    fi
+
+# Ensure newly built UCX libraries take absolute priority
+ENV LD_LIBRARY_PATH="${UCX_INSTALL_DIR}/lib:/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}"
+ENV PYTHONPATH="/opt/nvidia/nvda_nixl/lib/python3/dist-packages:${PYTHONPATH}"
+ENV UCX_LOG_LEVEL=info
+
+# Verify UCX can be loaded
+RUN ldconfig && \
+    ldd ${UCX_INSTALL_DIR}/lib/libucp.so.0 | grep -q "${UCX_INSTALL_DIR}" && \
+    echo "✅ UCX library path verified in LD cache"
+
+# (3) Build vLLM
+WORKDIR /llm
+ARG VLLM_BRANCH=main
+ARG VLLM_SRC_DIR=/tmp/vllm-base
+ARG VLLM_VERSION=v0.20.1
+
+RUN git clone https://github.com/vllm-project/vllm.git ${VLLM_SRC_DIR} && \
+    cd ${VLLM_SRC_DIR} && \
+    if [ -n "${VLLM_VERSION}" ]; then \
+        git checkout ${VLLM_VERSION} || \
+        ( echo "vLLM checkout to ${VLLM_VERSION} failed. Use branch ${VLLM_BRANCH}." && git reset --hard ); \
+    else \
+        echo "No VLLM_VERSION specified. Use branch ${VLLM_BRANCH}."; \
+    fi
+
+# Clean build directory
+RUN cd ${VLLM_SRC_DIR} && \
+    rm -rf .deps build dist vllm.egg-info __pycache__
+
+# numpy pin removed — vLLM 0.23.0 requires numpy>=2.0.0 (scipy dependency)
+
+# Install lm_eval before vllm
+RUN python -m pip install lm_eval
+
+# Build vLLM with CUDA target
+ARG MAX_JOBS=32
+WORKDIR ${VLLM_SRC_DIR}
+RUN VLLM_TARGET_DEVICE=cuda MAX_JOBS=${MAX_JOBS} python -m pip install -e .
+
+# Try flash-attn (optional — vLLM will fall back to FlashInfer if unavailable)
+RUN (pip uninstall -y flash-attn 2>/dev/null || true) && \
+    (FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=${MAX_JOBS} pip install flash-attn==2.8.3 --no-build-isolation 2>&1 && \
+    python -c "import flash_attn_2_cuda; print('✅ flash-attn installed')") || \
+    echo "⚠️  flash-attn unavailable — vLLM will use FLASHINFER backend"
+
+
+# Install test tools
+RUN pip install pytest
+
+# Patch NIXL worker for NIXL 1.3.0 telemetry API compatibility
+COPY patches/nixl_telemetry_patch.py /tmp/nixl_telemetry_patch.py
+RUN python3 /tmp/nixl_telemetry_patch.py
+
+# Clean up
+RUN apt-get clean && rm -rf /var/lib/apt/lists/*

@@ -1,0 +1,120 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+# ======== Base Stage ========
+ARG BASE_IMAGE=vllm-nvidia-gpu:my_custom_buildtag_v1
+FROM ${BASE_IMAGE}
+
+# Redeclare ARG after FROM to make it available in this build stage
+ARG BASE_IMAGE
+ARG https_proxy
+ARG http_proxy
+
+RUN echo "BASE_IMAGE = ${BASE_IMAGE}"
+
+##################################
+########## Tool Installation #####
+##################################
+
+# Install uv package manager
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+##################################
+########## Rust Setup ############
+##################################
+
+ARG ARCH=amd64
+ARG ARCH_ALT=x86_64
+
+# Rust environment setup
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    RUST_VERSION=1.90.0
+
+# Define Rust target based on ARCH_ALT ARG
+ARG RUSTARCH=${ARCH_ALT}-unknown-linux-gnu
+
+# Install Rust
+RUN wget --tries=3 --waitretry=5 "https://static.rust-lang.org/rustup/archive/1.28.1/${RUSTARCH}/rustup-init" && \
+    chmod +x rustup-init && \
+    ./rustup-init -y --no-modify-path --profile minimal --default-toolchain $RUST_VERSION --default-host ${RUSTARCH} && \
+    rm rustup-init && \
+    chmod -R a+w $RUSTUP_HOME $CARGO_HOME
+
+##################################
+########## External Services #####
+##################################
+
+
+##################################
+########## Dynamo Setup ##########
+##################################
+
+# Install additional tools and build dependencies for Dynamo
+# Some packages may not be available if Ubuntu archive is unreachable in build env.
+# protobuf/pybind11/libclang are build deps for Dynamo; pybind11 installed via pip below.
+# Use || true to avoid failing on unavailable packages; pip covers pybind11.
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        protobuf-compiler \
+        libprotobuf-dev \
+        libclang-dev \
+        git-lfs \
+        nano \
+        jq \
+    || apt-get install -y --no-install-recommends \
+        git-lfs nano jq || true && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install uv package manager
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Build Dynamo wheels (requires source code to be mounted or copied)
+ARG MAX_JOBS=16
+ENV DYNAMO_HOME=/opt/dynamo
+ARG DYNAMO_REPO=https://github.com/ai-dynamo/dynamo.git
+ARG DYNAMO_VERSION=v1.2.1
+
+# Clone dynamo
+RUN git clone ${DYNAMO_REPO} "${DYNAMO_HOME}" && \
+    cd "${DYNAMO_HOME}" && \
+    git checkout ${DYNAMO_VERSION}
+
+# Activate Dynamo virtual environment if it exists
+RUN if [ -d "${DYNAMO_HOME}/venv" ]; then \
+        echo "source ${DYNAMO_HOME}/venv/bin/activate" >> /root/.bashrc; \
+    fi
+
+# Build Dynamo wheels
+RUN cd ${DYNAMO_HOME} && \
+    pip install uv && \
+    pip install --upgrade meson pybind11 patchelf maturin[patchelf] tomlkit && \
+    uv build --wheel --out-dir ${DYNAMO_HOME}/dist && \
+    cd ${DYNAMO_HOME}/lib/bindings/python && \
+    pip install maturin && \
+    maturin build --release --out ${DYNAMO_HOME}/dist
+
+ENV CARGO_BUILD_JOBS=${MAX_JOBS}
+
+# Install Dynamo wheels
+RUN pip install \
+    ${DYNAMO_HOME}/dist/ai_dynamo_runtime*.whl \
+    ${DYNAMO_HOME}/dist/ai_dynamo*any.whl
+
+# Ensure numpy>=2.0.0 after all installs (Dynamo deps may downgrade it)
+RUN pip install --upgrade "numpy>=2.0.0"
+
+# Update LD_LIBRARY_PATH and PYTHONPATH for Dynamo
+ENV LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${DYNAMO_HOME}/lib
+ENV PYTHONPATH=${PYTHONPATH}:${DYNAMO_HOME}
+
+# Force Dynamo 0.8.0 to use NATS request plane instead of TCP
+ENV DYN_REQUEST_PLANE=nats
+
+# Set working directory
+COPY scripts/dynamo /workspace
+WORKDIR /workspace
+
+
